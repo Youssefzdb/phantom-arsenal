@@ -1,0 +1,12 @@
+{
+  "name": "phantom-arsenal",
+  "version": "4.0.0",
+  "type": "module",
+  "description": "Advanced Red Team Toolkit",
+  "scripts": {
+    "start": "node phisher.mjs"
+  },
+  "dependencies": {
+    "puppeteer": "^24.0.0"
+  }
+}
